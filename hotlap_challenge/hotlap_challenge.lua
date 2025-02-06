@@ -1,15 +1,18 @@
 local json = require "./dkjson"
+
 local session_start_time = nil
 local session_running = false
 local best_lap_time = -1
 local driver_name = ""
-local result_path = "./data/hotlap_results.json"
-local session_duration = 600000  -- 10 minutes in milliseconds
+local result_url = "https://api.jsonbin.io/v3/b/67a105ebe41b4d34e4837cde"
+local master_key = "$2a$10$nXo5EIMscPbedTWyQmS3SO.jLsETSi10/SSElTI7b1ZqfVPW8CZkm"
+local session_duration = 600000
 local time_left = session_duration
 local lap_data = {}
 local current_lap_start_time = nil
 local first_lap_completed = false
 
+-- Helper function to format time
 local function formatTime(ms)
     local minutes = math.floor(ms / 60000)
     local seconds = math.floor((ms % 60000) / 1000)
@@ -17,7 +20,51 @@ local function formatTime(ms)
     return string.format("%02d:%02d:%03d", minutes, seconds, milliseconds)
 end
 
--- Draw the app's interface
+-- Async function to fetch JSON data from the remote API using web.get
+local function fetch_remote_json_async(callback)
+    web.get(result_url, {
+        ["X-Master-Key"] = master_key
+    }, function(err, response)
+        if err then
+            ac.log("Failed to fetch JSON: " .. err)
+            callback(nil)  -- Notify failure to caller
+            return
+        end
+        try(function()
+            local data = json.decode(response.body)
+            callback(data.record)  -- Notify success to caller
+        end, function(parse_err)
+            ac.log("Failed to parse JSON: " .. parse_err)
+            callback(nil)  -- Notify failure to caller
+        end)
+    end)
+end
+
+-- Async function to update JSON data on the remote API using web.put
+local function update_remote_json_async(data, callback)
+    local request_body = json.encode(data)
+    
+    ac.debug(request_body)
+
+    web.request("PUT", result_url, {
+        ["X-Master-Key"] = master_key,
+        ["Content-Type"] = "application/json"
+    }, request_body, function(err, response)
+        if err then
+            ac.log('Failed to update JSON: ' .. err)
+            callback(false)  -- Notify failure
+            return
+        end
+        if response.status == 200 then
+            ac.log("Remote JSON data updated successfully.")
+            callback(true)  -- Notify success
+        else
+            ac.log("Failed to update remote JSON. Status code: " .. response.status)
+            callback(false)  -- Notify failure
+        end
+    end)
+end
+
 function script.draw()
     local draw_top_left = vec2(0, 22)
     local draw_size = ui.windowSize() - vec2(0, 22)
@@ -30,11 +77,9 @@ function script.draw()
         rgbm(1, 1, 1, 1)
     )
 
-    -- Add some padding below the image
     ui.dummy(vec2(0, ui.windowHeight() * 0.2 + 10))
     ui.drawRect(ui.getCursor(), ui.getCursor() + vec2(300, 2), rgbm.colors.black)
 
-    -- Set text size
     ui.pushFont(ui.Font.Big)
 
     ui.beginGradientShade()
@@ -50,7 +95,6 @@ function script.draw()
 
         if ui.button("Start Session") and driver_name ~= "" then
             start_session()
-            save_session_data_test()
         end
     else
         ui.text("Session Running: Driver - " .. driver_name)
@@ -72,114 +116,80 @@ function script.draw()
     ui.popFont()
 end
 
--- Function to start the session
 function start_session()
     session_running = true
-    session_start_time = os.clock() * 1000  -- Use os.clock() to get the current time in milliseconds
+    session_start_time = os.clock() * 1000  
     time_left = session_duration
     lap_data = {}
     best_lap_time = -1
     current_lap_start_time = os.clock() * 1000
     first_lap_completed = false
 
-    local carIndex = 0 -- Assuming player is car 0
-    local spawnSet = ac.SpawnSet.HotlapStart -- Use the spawn set for the hotlap start
+    local carIndex = 0 
+    local spawnSet = ac.SpawnSet.HotlapStart 
     physics.teleportCarTo(carIndex, spawnSet)
 
     ac.log("Car teleported to the hotlap start!")
-    ac.log("Session started!")
-
-    print("Session started for " .. driver_name)
+    ac.log("Session started for " .. driver_name)
 end
 
--- Function to reset the car to the Hotlap start position
 function reset_to_start()
-    local carIndex = 0 -- Assuming player is car 0
-    local spawnSet = ac.SpawnSet.HotlapStart -- Use the spawn set for the hotlap start
+    local carIndex = 0
+    local spawnSet = ac.SpawnSet.HotlapStart
     physics.teleportCarTo(carIndex, spawnSet)
     current_lap_start_time = os.clock() * 1000
     first_lap_completed = false
-    print("Car reset to Hotlap start for " .. driver_name)
+    ac.log("Car reset to Hotlap start for " .. driver_name)
 end
 
 -- Function to end the session
 function end_session()
+    save_session_data_async()
+    
     session_running = false
-    save_session_data()
-    reset_ui()
-    local carIndex = 0 -- Assuming player is car 0
-    local spawnSet = ac.SpawnSet.HotlapStart -- Use the spawn set for the hotlap start
+    local carIndex = 0
+    local spawnSet = ac.SpawnSet.HotlapStart
     physics.teleportCarTo(carIndex, spawnSet)
 
     ac.log("Car teleported to the hotlap start!")
     ac.tryToRestartSession()
-    print("Session ended for " .. driver_name)
+    reset_ui()
+    ac.log("Session ended for " .. driver_name)
 end
 
--- Function to save the session data to a JSON file
-function save_session_data()
-    
-    if #lap_data <= 1 then
-        print("No laps recorded.")
+function save_session_data_async()
+    if #lap_data < 1 then
+        ac.log("No laps recorded.")
         return
     end
 
-    -- Read existing results or create a new table
-    local file = io.open(result_path, "r")
-    local results = {}
-
-    if file then
-        local content = file:read("*a")
-        print(results)
-        results = json.decode(content)
-        file:close()
-    end
-
-    -- Add the new session data
-    table.insert(results, {
+    local data = {
         name = driver_name,
         best_lap_time = best_lap_time,
+        best_timeFormatted = formatTime(best_lap_time),
         laps = lap_data
-    })
-
-    print(results)
-    -- Write the updated results back to the file
-    file = io.open(result_path, "w")
-    file:write(json.encode(results, { indent = true }))
-    file:close()
-
-    print("Session data saved for " .. driver_name)
-end
-
-
-function save_session_data_test()
-    
-    -- Read existing results or create a new table
-    local file = io.open(result_path, "r")
-    local results = {"tets":223
     }
 
-    if file then
-        local content = file:read("*a")
-        print(results)
-        results = json.decode(content)
-        file:close()
-    end
+    fetch_remote_json_async(function(results)
+        if not results then
+            ac.log("Failed to fetch remote JSON data.")
+            return
+        end
+        
+        -- Add the new session data
+        table.insert(results, data)
+        -- Sort the best times
+        table.sort(results, function(a, b) return a.best_lap_time < b.best_lap_time end)
 
-    -- Add the new session data
-    table.insert(results, {
-        name = driver_name,
-        best_lap_time = best_lap_time,
-        laps = lap_data
-    })
-
-    print(results)
-    -- Write the updated results back to the file
-    file = io.open(result_path, "w")
-    file:write(json.encode(results, { indent = true }))
-    file:close()
-
-    print("Session data saved for " .. driver_name)
+        -- Update the remote JSON asynchronously
+        update_remote_json_async(results, function(success)
+            if success then
+                ac.log("Session data saved successfully.")
+            else
+                ac.log("Failed to save session data.")
+            end
+        end)
+    end)
 end
 
 -- Function to reset the UI after session ends
@@ -194,7 +204,7 @@ function track_laps()
     if session_running then
         local car = ac.getCar(0)
         -- Check if 10 minutes are over
-        local current_time = os.clock() * 1000  -- Use os.clock() to get the current time in milliseconds
+        local current_time = os.clock() * 1000
         time_left = session_duration - (current_time - session_start_time)
 
         -- If time is up, end the session automatically
@@ -217,7 +227,8 @@ function track_laps()
                     -- Add lap time to lap data
                     table.insert(lap_data, {
                         lap = #lap_data + 1,
-                        time = lap_time
+                        time = lap_time,
+                        timeFormatted = formatTime(lap_time)
                     })
                 else
                     first_lap_completed = true
